@@ -1,17 +1,17 @@
 # Polymarket Data (v2)
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
-[![GitHub stars](https://img.shields.io/github/stars/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/stargazers)
-[![GitHub last commit](https://img.shields.io/github/last-commit/warproxxx/poly_data)](https://github.com/warproxxx/poly_data/commits/main)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-A pipeline for fetching, processing, and analyzing Polymarket v2 trading data. Streams order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), joins them with market metadata from the Polymarket CLOB API, and writes structured trades to CSV.
+A pipeline for fetching, processing, and analyzing Polymarket v2 trading data — plus a wallet tracker that profiles any address as Maker/Taker. Streams order events directly from the Polymarket **CTF Exchange V2** contract on Polygon via [Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview), joins them with market metadata from the Polymarket CLOB API, and writes structured trades to Parquet.
+
+中文全景说明（三块东西关系、数据边界、实操命令）见 [`链上数据与钱包跟踪-使用说明.md`](链上数据与钱包跟踪-使用说明.md)。
 
 ## ⚠️ v1 → v2 migration
 
 Polymarket migrated to a new set of CTF Exchange contracts on **2026-04-28** and stopped supporting their old subgraph indexer. The old pipeline in this repo (Goldsky subgraph + GraphQL polling) **no longer returns complete data**, so it has been removed.
 
-The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag if you need it for historical analysis. **For any new work, use this v2 version.**
+The previous version is preserved at the [`v1-final`](https://github.com/warproxxx/poly_data/tree/v1-final) tag in the original repository if you need it for historical analysis. **For any new work, use this v2 version.**
 
 The V1 retriever used goldsky, but now goldsky only gives data through a turbo pipeline that is expensive and complex. 
 
@@ -159,6 +159,9 @@ poly_data/
 │   └── process_live.py        # join order parts ↔ markets → processed/trades/trades_part_*.parquet
 ├── poly_utils/
 │   └── utils.py               # market loader, missing-token backfill
+├── wallet_tracker/            # per-address Maker/Taker profiling (see below)
+│   ├── cli.py
+│   └── src/user_tracker/      # annotate / query / store / freshness
 ├── tests/                     # pytest unit tests (pure, offline)
 ├── data/                      # all generated data + resume state (gitignored)
 │   ├── markets.csv            # all markets (id = condition_id, clobTokenIds, …)
@@ -237,6 +240,16 @@ Opens a HyperSync stream filtered to the CTF Exchange V2 contract and the `Order
 Reads the raw order parts (`data/order_filled/part_*.parquet`), skips any part index that already has a `processed/trades/trades_part_*.parquet`, joins the rest against `get_markets()` (which parses `clobTokenIds` into `token1`/`token2`), computes price/USD/direction, and writes one trades part per order part. Whole-part granularity means resume is trivial and a crash mid-part can't corrupt output.
 
 If any trade references a token ID not in `markets.csv`, it's backfilled into `missing_markets.csv` via batched, parallel Gamma API requests before the join (the CLOB list isn't queryable by token ID, so Gamma's `clob_token_ids` lookup is used here), with `id` = `conditionId` to stay consistent with `markets.csv`.
+
+## Wallet Tracker
+
+`wallet_tracker/` tracks a configured set of addresses and labels each of their fills as **Maker** or **Taker**, on top of the same `processed/trades` output — useful for wallet intelligence / copy-trading research.
+
+- Tracked wallets: `data/tracked_wallets/wallets.json` (config knobs in `wallet_tracker/config.toml`)
+- CLI: `python -m wallet_tracker.cli` — annotate / rebuild / status (see `wallet_tracker/README.md`)
+- Output: `data/tracked_wallets/{address}/...` per-wallet M/T profiles
+
+Known boundary: fills that happened on the **v1** contract (before the 2026-04-28 migration) cannot be M/T-labeled by this v2-only dataset.
 
 ## Tests
 
