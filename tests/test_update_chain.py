@@ -1,0 +1,230 @@
+"""Tier-1 unit tests for the HyperSync decode logic in update_chain.
+
+The most safety-critical piece is _decode_log's side->asset mapping: a flip
+would silently mislabel every trade. We build synthetic OrderFilled logs with
+eth_abi.encode (a real dependency) so decode is checked against known inputs.
+"""
+
+import json
+import os
+import types
+
+import hypersync
+import polars as pl
+import pytest
+import update_utils.update_chain as uc
+from eth_abi import encode as abi_encode
+from update_utils.update_chain import (
+    _DATA_TYPES,
+    _as_int,
+    _build_query,
+    _decode_log,
+    _fmt_ts,
+    _hex_to_bytes,
+)
+
+
+class TestFmtTs:
+    def test_epoch(self):
+        assert _fmt_ts(0) == "1970-01-01 00:00:00"
+
+    def test_known_utc(self):
+        # 1_700_000_000 = 2023-11-14 22:13:20 UTC
+        assert _fmt_ts(1_700_000_000) == "2023-11-14 22:13:20"
+
+
+def _topic_addr(addr_40hex: str) -> str:
+    """A 20-byte address left-padded to a 32-byte topic, as a hex string."""
+    return "0x" + "00" * 12 + addr_40hex
+
+
+def _make_log(
+    side,
+    token_id,
+    maker_amt,
+    taker_amt,
+    fee=0,
+    maker="aa" * 20,
+    taker="bb" * 20,
+    block_number=100,
+    tx_hash="0x" + "cd" * 32,
+):
+    data = abi_encode(
+        _DATA_TYPES,
+        [side, token_id, maker_amt, taker_amt, fee, b"\x00" * 32, b"\x00" * 32],
+    )
+    return types.SimpleNamespace(
+        topics=["0xsig", "0xorderhash", _topic_addr(maker), _topic_addr(taker)],
+        data="0x" + data.hex(),
+        block_number=block_number,
+        transaction_hash=tx_hash,
+    )
+
+
+class TestAsInt:
+    def test_int_passthrough(self):
+        assert _as_int(123) == 123
+
+    def test_hex_string(self):
+        assert _as_int("0x10") == 16
+
+    def test_decimal_string(self):
+        assert _as_int("42") == 42
+
+    def test_invalid_raises(self):
+        with pytest.raises(TypeError):
+            _as_int(1.5)
+
+
+class TestHexToBytes:
+    def test_with_prefix(self):
+        assert _hex_to_bytes("0x0a0b") == b"\x0a\x0b"
+
+    def test_without_prefix(self):
+        assert _hex_to_bytes("0a0b") == b"\x0a\x0b"
+
+
+class TestDecodeLog:
+    def test_maker_buys_side0(self):
+        # side=0 -> maker pays USDC (makerAssetId "0"), receives the outcome token
+        log = _make_log(
+            side=0, token_id=12345, maker_amt=3_400_000, taker_amt=5_000_000
+        )
+        (
+            ts,
+            maker,
+            maker_aid,
+            maker_amt,
+            taker,
+            taker_aid,
+            taker_amt,
+            txh,
+            order_hash,
+            fee,
+        ) = _decode_log(log, {100: 1_700_000_000})
+        assert ts == 1_700_000_000
+        assert maker == "0x" + "aa" * 20
+        assert taker == "0x" + "bb" * 20
+        assert maker_aid == "0"
+        assert taker_aid == "12345"
+        assert maker_amt == 3_400_000
+        assert taker_amt == 5_000_000
+        assert txh == "0x" + "cd" * 32
+        assert order_hash == "0xorderhash"
+        assert fee == 0
+
+    def test_maker_sells_side1(self):
+        # side=1 -> maker gives the token, receives USDC (takerAssetId "0")
+        log = _make_log(side=1, token_id=999, maker_amt=5_000_000, taker_amt=3_400_000)
+        row = _decode_log(log, {100: 1})
+        assert row[2] == "999"
+        assert row[5] == "0"
+
+    def test_fee_decoded(self):
+        # fee is the 5th data param (6 decimals); make sure it round-trips
+        log = _make_log(side=0, token_id=1, maker_amt=1, taker_amt=1, fee=12_345)
+        assert _decode_log(log, {100: 1})[9] == 12_345
+
+    def test_addresses_lowercased(self):
+        log = _make_log(
+            side=0,
+            token_id=1,
+            maker_amt=1,
+            taker_amt=1,
+            maker="AB" * 20,
+            taker="CD" * 20,
+        )
+        row = _decode_log(log, {100: 1})
+        assert row[1] == "0x" + "ab" * 20
+        assert row[4] == "0x" + "cd" * 20
+
+    def test_txhash_gets_0x_prefix(self):
+        log = _make_log(side=0, token_id=1, maker_amt=1, taker_amt=1, tx_hash="ef" * 32)
+        assert _decode_log(log, {100: 1})[7] == "0x" + "ef" * 32
+
+    def test_block_number_as_hex(self):
+        log = _make_log(
+            side=0, token_id=1, maker_amt=1, taker_amt=1, block_number="0x64"
+        )
+        assert _decode_log(log, {100: 1_234})[0] == 1_234
+
+
+class TestBuildQuery:
+    def test_constructs_query(self):
+        # to_block is exclusive in HyperSync, so the helper passes to_block + 1.
+        q = _build_query(100, 200)
+        assert isinstance(q, hypersync.Query)
+
+
+class TestCursor:
+    def test_save_load_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(tmp_path / "cursor.json"))
+        uc._save_cursor(90_000_000, 7890)
+        assert uc._load_cursor() == (90_000_000, 7890)
+
+    def test_legacy_without_part_index(self, tmp_path, monkeypatch):
+        # old cursor lacking part_index -> infer next part index from disk
+        p = tmp_path / "cursor.json"
+        p.write_text(json.dumps({"last_block": 90_000_000}))
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(p))
+        monkeypatch.setattr(uc, "PARTS_DIR", str(tmp_path / "order_filled"))
+        assert uc._load_cursor() == (90_000_000, 0)
+
+    def test_missing_returns_genesis(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(tmp_path / "nope.json"))
+        monkeypatch.setattr(uc, "PARTS_DIR", str(tmp_path / "order_filled"))
+        assert uc._load_cursor() == (uc.V2_GENESIS_BLOCK, 0)
+
+    def test_below_genesis_ignored(self, tmp_path, monkeypatch):
+        p = tmp_path / "cursor.json"
+        p.write_text(json.dumps({"last_block": 1, "part_index": 5}))
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(p))
+        monkeypatch.setattr(uc, "PARTS_DIR", str(tmp_path / "order_filled"))
+        assert uc._load_cursor() == (uc.V2_GENESIS_BLOCK, 0)
+
+    def test_atomic_write_leaves_no_tmp(self, tmp_path, monkeypatch):
+        cf = tmp_path / "cursor.json"
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(cf))
+        uc._save_cursor(88_000_000, 100)
+        assert cf.exists()
+        assert not (tmp_path / "cursor.json.tmp").exists()
+
+    def test_infers_next_part_from_disk(self, tmp_path, monkeypatch):
+        # no cursor at all, but part_00000002.parquet already on disk
+        parts = tmp_path / "order_filled"
+        parts.mkdir()
+        (parts / "part_00000000.parquet").write_bytes(b"x")
+        (parts / "part_00000002.parquet").write_bytes(b"x")
+        monkeypatch.setattr(uc, "CURSOR_FILE", str(tmp_path / "nope.json"))
+        monkeypatch.setattr(uc, "PARTS_DIR", str(parts))
+        assert uc._load_cursor() == (uc.V2_GENESIS_BLOCK, 3)
+
+
+class TestFlushPart:
+    def test_flush_writes_parquet_and_is_atomic(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(uc, "PARTS_DIR", str(tmp_path))
+        path = uc._flush_part(
+            [
+                [
+                    1_700_000_000,
+                    "0xaa",
+                    "0",
+                    3_400_000,
+                    "0xbb",
+                    "12345",
+                    5_000_000,
+                    "0xtx",
+                    "0xoh",
+                    0,
+                ],
+            ],
+            0,
+        )
+        assert path.endswith("part_00000000.parquet")
+        # no .tmp left behind
+        assert not os.path.exists(path + ".tmp")
+        df = pl.read_parquet(path)
+        assert df.columns == list(uc.COLUMNS)
+        assert df["makerAmountFilled"][0] == 3_400_000
+        assert df["maker"][0] == "0xaa"
+        assert df["fee"][0] == 0

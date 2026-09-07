@@ -1,0 +1,36 @@
+[tracker]
+# 默认起始日期(未指定时): 用账号最早可查时间或此日期兜底
+default_start = "2026-01-01"
+# 增量更新时向前回看的天数(去重补漏)
+lookback_days = 2
+# 每次更新后是否自动重建 parquet
+auto_rebuild = true
+# 钱包 update 前是否强制检查链上新鲜度
+# (为 true 时, 若链上停更超过 stale_threshold_hours → 提示并跳过, 需先 uv run poly-data)
+require_chain_fresh = true
+# 链上 order_filled 停更多久(小时)算陈旧: 超过则 update 前提醒先 uv run poly-data.
+# 注: 链上 archive 天然滞后 ~1h(reorg buffer), 故阈值默认 6h 为正常容忍.
+stale_threshold_hours = 6
+
+[proxy]
+# 走本地代理拉 Polymarket data-api (GFW 环境)
+enabled = true
+url = "http://127.0.0.1:10808"
+
+[poly_data]
+# 注: order_filled 目录路径不再手写——由 config.py 从 poly_data 根自动推导
+#     (poly_data/data/order_filled). 这里只保留需要显式指定的常量.
+# 撮合系统合约地址(标注时忽略其对手行)
+match_contract = "0xe111180000d2663c0091e4f400237545b87b996b"
+
+[annotation]
+# v1→v2 迁移截止(UTC): 2026-04-28 v1→v2 迁移, 迁移前主撮合在 v1 合约
+# (0x4bfb41d5...), 本库 order_filled 只采 v2(0xe111...), 故 v1 期交易查不到.
+# 此时间之前(默认 2026-04-29 00:00 前)的交易**不做 M/T 判定**, 统一标 V1
+# (v1 期, 永久无法标注); 之后才尝试标注 M/T. 若日后确认某钱包在迁移前真走
+# v2, 可把此时间调早(如 "2026-04-23T00:00:00Z")以允许标注.
+v1_cutoff = "2026-04-29T00:00:00Z"
+
+[api]
+base = "https://data-api.polymarket.com/activity"
+page = 500
