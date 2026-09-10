@@ -435,7 +435,18 @@ async def _run() -> None:
             "product access at https://envio.dev/app/api-tokens and add it to "
             ".env as HYPERSYNC_API."
         )
-    client = hypersync.HypersyncClient(ClientConfig(url=url, bearer_token=token))
+    # 调大单请求超时: 默认超时太短时, 大响应(arrow 数据流)读到一半会被判
+    # operation timed out(曾 0 logs 全失败); 调大后能持续拉。重试次数也可配。
+    timeout_ms = int(os.environ.get("HYPERSYNC_TIMEOUT_MS", "300000"))
+    n_retries = int(os.environ.get("HYPERSYNC_NUM_RETRIES", "10"))
+    client = hypersync.HypersyncClient(
+        ClientConfig(
+            url=url,
+            bearer_token=token,
+            http_req_timeout_millis=timeout_ms,
+            max_num_retries=n_retries,
+        )
+    )
 
     print(f"[{_now()}] HyperSync: {url} (with token)")
 
@@ -454,25 +465,61 @@ async def _run() -> None:
         print(f"[{_now()}] Already up to date.")
         return
 
-    query = _build_query(start_block, safe_height)
-    receiver = await client.stream(query, StreamConfig())
+    # 分小段拉取: 单个 HyperSync query 若跨超大块范围, 本地网络读大响应会
+    # operation timed out(曾把 ~32 万块做成单 query, 拉几千行就超时重试 15 次崩)。
+    # 每段独立 query+stream, 段内失败按 cursor 续传重试, 段间自动续。
+    # 可用 CHAIN_SEGMENT_BLOCKS / CHAIN_SEGMENT_RETRIES 调段大小与重试次数。
+    # 段默认 3000 块: 每段约 19 万 logs / 5 分钟级, 单连接可完成且断点粒度小;
+    # 段太大(如 2 万块)单段长时间拉取中途仍易超时。
+    seg_blocks = int(os.environ.get("CHAIN_SEGMENT_BLOCKS", "3000"))
+    retries = int(os.environ.get("CHAIN_SEGMENT_RETRIES", "6"))
 
-    print(f"[{_now()}] Streaming blocks {start_block:,} → {safe_height + 1:,}")
-
-    try:
-        part_index, completed, total = await _consume(
-            receiver, start_block, part_index, safe_height + 1
+    while True:
+        cur_block, part_index = _load_cursor()
+        if cur_block > safe_height:
+            break
+        end_block = min(cur_block + seg_blocks - 1, safe_height)
+        print(
+            f"[{_now()}] Segment blocks {cur_block:,} → {end_block:,}  "
+            f"(next part index {part_index:,})"
         )
-    except KeyboardInterrupt:
-        # _consume already flushed the tail and persisted the cursor at the last
-        # consumed batch boundary; just report and exit cleanly.
-        print(f"\n[{_now()}] Interrupted. Cursor saved; resume will continue.")
-        return
-
-    if completed:
-        print(f"[{_now()}] Done. Processed {total:,} new rows into {PARTS_DIR}/")
-    else:
-        print(f"[{_now()}] Stream ended unexpectedly after {total:,} rows.")
+        completed = False
+        total = 0
+        for attempt in range(1, retries + 1):
+            query = _build_query(cur_block, end_block)
+            try:
+                receiver = await client.stream(query, StreamConfig())
+                part_index, completed, total = await _consume(
+                    receiver, cur_block, part_index, end_block + 1
+                )
+                break
+            except KeyboardInterrupt:
+                # _consume 已在中断时落盘尾部并保存 cursor, 干净退出。
+                print(f"\n[{_now()}] Interrupted. Cursor saved; resume will continue.")
+                return
+            except Exception as e:
+                print(
+                    f"[{_now()}] segment {cur_block:,}-{end_block:,} "
+                    f"attempt {attempt}/{retries} failed: {type(e).__name__}: {e}"
+                )
+                if attempt >= retries:
+                    print(
+                        f"[{_now()}] segment failed after {retries} attempts; "
+                        f"cursor saved at last consumed block — rerun to continue."
+                    )
+                    return
+                # _consume 中断时已把 cursor 存到实际 consumed 的 batch 边界;
+                # 重试从最新 cursor 续拉该段剩余部分。
+                cur_block, part_index = _load_cursor()
+                if cur_block > end_block:  # 该段其实已推完
+                    completed = True
+                    break
+        # 安全阀: 成功返回但 cursor 无推进(理论不发生)时避免死循环。
+        new_block, _ = _load_cursor()
+        if not completed and new_block <= cur_block:
+            print(f"[{_now()}] no progress on segment; aborting to avoid loop")
+            return
+    print(f"[{_now()}] Done. All segments processed into {PARTS_DIR}/")
 
 
 def update_chain() -> None:
